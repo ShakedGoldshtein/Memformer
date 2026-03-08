@@ -1,0 +1,6 @@
+# Memristor LM – WikiText-2
+torch>=2.0
+datasets>=2.14
+tokenizers>=0.15
+tqdm
+wandb>=0.15
