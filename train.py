@@ -178,10 +178,10 @@ def main():
     n_heads = 4
     d_ff = 1024
     lr = 3e-4
-    weight_decay = 0.01
+    weight_decay =  0.01
     epochs = 3
 
-    print("Loading data...")
+    print("Loading data....")
     train_loader, val_loader, test_loader, vocab_size, pad_idx = get_dataloaders(
         batch_size=batch_size,
         block_size=block_size,
