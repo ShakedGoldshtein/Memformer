@@ -13,6 +13,9 @@ from load_data import get_wikitext2
 from model import TransformerLM
 
 
+# Model name: base_model now; change to e.g. memristor_model for other variants
+MODEL_NAME = "base_model"
+
 # Vocabulary and simple tokenizer
 PAD, UNK, EOS = "<pad>", "<unk>", "<eos>"
 
@@ -247,10 +250,14 @@ def main():
                 print(f"Early stopping: no improvement for {patience} epochs.")
                 break
 
-    # Restore best model and save
+    # Restore best model and save in base_model_weights/<run_id>/
     if best_state is not None:
         model.load_state_dict(best_state)
-    weights_path = "model_weights.pt"
+    weights_dir = f"{MODEL_NAME}_weights"
+    run_name = wandb.run.id if wandb.run is not None else "manual_run"
+    run_dir = os.path.join(weights_dir, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    weights_path = os.path.join(run_dir, "model_weights.pt")
     torch.save(model.state_dict(), weights_path)
     print(f"Model weights saved to {weights_path}")
 
