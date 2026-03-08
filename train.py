@@ -2,6 +2,7 @@
 Train transformer on WikiText-2: tokenizer, data, training loop.
 """
 import math
+import os
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
@@ -64,36 +65,45 @@ class LMDataset(Dataset):
 
 
 def get_dataloaders(batch_size=32, block_size=128, max_vocab=15000):
-    """Load data, build vocabulary, return train and validation DataLoaders."""
+    """Load data, build vocabulary, return train, validation, and test DataLoaders."""
     train_ds = get_wikitext2("train")
     val_ds = get_wikitext2("validation")
+    test_ds = get_wikitext2("test")
     vocab = build_vocab(train_ds, max_vocab=max_vocab)
     vocab_size = len(vocab)
     pad_idx = vocab[PAD]
 
     train_tokens = get_all_tokens(train_ds, vocab)
     val_tokens = get_all_tokens(val_ds, vocab)
+    test_tokens = get_all_tokens(test_ds, vocab)
 
     train_dataset = LMDataset(train_tokens, block_size)
     val_dataset = LMDataset(val_tokens, block_size)
+    test_dataset = LMDataset(test_tokens, block_size)
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=0,
-        pin_memory=False,
+        num_workers=4,
+        pin_memory=True,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=4,
     )
-    return train_loader, val_loader, vocab_size, pad_idx
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+    )
+    return train_loader, val_loader, test_loader, vocab_size, pad_idx
 
 
-def train_epoch(model, loader, optimizer, device, causal_mask):
+def train_epoch(model, loader, optimizer, device, causal_mask, pad_idx):
     model.train()
     total_loss = 0.0
     n = 0
@@ -106,7 +116,7 @@ def train_epoch(model, loader, optimizer, device, causal_mask):
         loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
             y.reshape(-1),
-            ignore_index=-100,
+            ignore_index=pad_idx,
         )
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -121,8 +131,8 @@ def train_epoch(model, loader, optimizer, device, causal_mask):
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, causal_mask):
-    """Single pass over validation: returns (perplexity, accuracy)."""
+def evaluate(model, loader, device, causal_mask, pad_idx):
+    """Single pass: returns (perplexity, accuracy, avg_loss)."""
     model.eval()
     total_loss = 0.0
     total_correct = 0
@@ -134,7 +144,7 @@ def evaluate(model, loader, device, causal_mask):
         loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
             y.reshape(-1),
-            ignore_index=-100,
+            ignore_index=pad_idx,
         )
         total_loss += loss.item() * x.size(0)
         pred = logits.argmax(dim=-1)
@@ -142,18 +152,25 @@ def evaluate(model, loader, device, causal_mask):
         n_tokens += y.numel()
         n_samples += x.size(0)
     if n_samples == 0:
-        return float("inf"), 0.0
+        return float("inf"), 0.0, float("inf")
     avg_loss = total_loss / n_samples
     ppl = math.exp(avg_loss)
     acc = total_correct / n_tokens
-    return ppl, acc
+    return ppl, acc, avg_loss
 
 
 def main():
+    # Load wandb API key from project file if not set
+    if not os.environ.get("WANDB_API_KEY"):
+        key_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".wandb_key")
+        if os.path.isfile(key_file):
+            with open(key_file) as f:
+                os.environ["WANDB_API_KEY"] = f.read().strip()
+
     device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    batch_size = 32
+    batch_size = 64
     block_size = 128
     max_vocab = 15000
     d_model = 256
@@ -161,10 +178,11 @@ def main():
     n_heads = 4
     d_ff = 1024
     lr = 3e-4
+    weight_decay = 0.01
     epochs = 3
 
     print("Loading data...")
-    train_loader, val_loader, vocab_size, pad_idx = get_dataloaders(
+    train_loader, val_loader, test_loader, vocab_size, pad_idx = get_dataloaders(
         batch_size=batch_size,
         block_size=block_size,
         max_vocab=max_vocab,
@@ -178,11 +196,11 @@ def main():
         n_heads=n_heads,
         d_ff=d_ff,
         max_seq_len=block_size,
-        dropout=0.1,
+        dropout=0.2,
         pad_idx=pad_idx,
     ).to(device)
     causal_mask = model.get_causal_mask(block_size, device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     wandb.init(
         project="Memristor-LM",
@@ -196,15 +214,54 @@ def main():
             "n_heads": n_heads,
             "d_ff": d_ff,
             "learning_rate": lr,
+            "weight_decay": weight_decay,
+            "dropout": 0.2,
             "dataset": "WikiText-2",
         },
     )
 
+    # Early stopping: stop if val_loss doesn't improve for `patience` epochs
+    patience = 2
+    best_val_loss = float("inf")
+    best_state = None
+    patience_counter = 0
+
     for epoch in range(epochs):
-        train_loss = train_epoch(model, train_loader, optimizer, device, causal_mask)
-        ppl, val_acc = evaluate(model, val_loader, device, causal_mask)
-        wandb.log({"train_loss_epoch": train_loss, "perplexity": ppl, "val_accuracy": val_acc})
-        print(f"Epoch {epoch+1}/{epochs}  train_loss={train_loss:.4f}  val_perplexity={ppl:.2f}  val_accuracy={val_acc:.4f}")
+        train_loss = train_epoch(model, train_loader, optimizer, device, causal_mask, pad_idx)
+        ppl, val_acc, val_loss = evaluate(model, val_loader, device, causal_mask, pad_idx)
+        wandb.log({
+            "train_loss_epoch": train_loss,
+            "perplexity": ppl,
+            "val_accuracy": val_acc,
+            "val_loss": val_loss,
+        })
+        print(f"Epoch {epoch+1}/{epochs}  train_loss={train_loss:.4f}  val_perplexity={ppl:.2f}  val_accuracy={val_acc:.4f}  val_loss={val_loss:.4f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping: no improvement for {patience} epochs.")
+                break
+
+    # Restore best model and save
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    weights_path = "model_weights.pt"
+    torch.save(model.state_dict(), weights_path)
+    print(f"Model weights saved to {weights_path}")
+
+    # Final evaluation on test set
+    test_ppl, test_acc, test_loss = evaluate(model, test_loader, device, causal_mask, pad_idx)
+    wandb.log({
+        "test_perplexity": test_ppl,
+        "test_accuracy": test_acc,
+        "test_loss": test_loss,
+    })
+    print(f"Test  perplexity={test_ppl:.2f}  accuracy={test_acc:.4f}  loss={test_loss:.4f}")
 
     wandb.finish()
     print("Training done.")

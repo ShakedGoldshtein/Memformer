@@ -1,4 +1,7 @@
 __pycache__/
 wandb/
+.wandb_key
 *.pt
 .DS_Store
+github_key
+github_key.pub

@@ -55,7 +55,7 @@ class TransformerLM(nn.Module):
         n_heads=4,
         d_ff=1024,
         max_seq_len=128,
-        dropout=0.1,
+        dropout=0.2,
         pad_idx=0,
     ):
         super().__init__()
