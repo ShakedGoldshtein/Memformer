@@ -178,10 +178,10 @@ def main():
     max_vocab = 15000
     d_model = 256
     n_layers = 4
-    n_heads = 4
+    n_heads = 8
     d_ff = 1024
     lr = 3e-4
-    weight_decay =  0.01
+    weight_decay =  0.1
     epochs = 3
 
     print("Loading data....")
@@ -199,7 +199,7 @@ def main():
         n_heads=n_heads,
         d_ff=d_ff,
         max_seq_len=block_size,
-        dropout=0.2,
+        dropout=0.3,
         pad_idx=pad_idx,
     ).to(device)
     causal_mask = model.get_causal_mask(block_size, device)
