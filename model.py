@@ -54,7 +54,7 @@ class TransformerLM(nn.Module):
         n_layers=4,
         n_heads=4,
         d_ff=1024,
-        max_seq_len=128,
+        max_seq_len=256,
         dropout=0.2,
         pad_idx=0,
     ):
