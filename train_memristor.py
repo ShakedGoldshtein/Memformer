@@ -118,16 +118,49 @@ def main():
     device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    batch_size = 64
-    block_size = 128
-    max_vocab = 15000
-    d_model = 256
-    n_layers = 4
-    n_heads = 4
-    d_ff = 1024
-    lr = 3e-4
-    weight_decay = 0.1
-    epochs = 3
+    # Default hyperparameters (can be overridden by W&B sweeps)
+    default_config = dict(
+        epochs=3,
+        batch_size=64,
+        block_size=128,
+        max_vocab=15000,
+        d_model=256,
+        n_layers=4,
+        n_heads=4,
+        d_ff=1024,
+        learning_rate=3e-4,
+        weight_decay=0.1,
+        dropout=0.3,
+        dataset="WikiText-2",
+        ADC_resolution=8,
+        n_conductance_states=None,
+        noise_scale=0.0,
+        t_min=1e-3,
+    )
+
+    wandb.init(
+        project="Memristor-LM",
+        config=default_config,
+    )
+    cfg = wandb.config
+
+    batch_size = cfg.batch_size
+    block_size = cfg.block_size
+    max_vocab = cfg.max_vocab
+    d_model = cfg.d_model
+    n_layers = cfg.n_layers
+    n_heads = cfg.n_heads
+    d_ff = cfg.d_ff
+    lr = cfg.learning_rate
+    weight_decay = cfg.weight_decay
+    epochs = cfg.epochs
+
+    adc_resolution = cfg.ADC_resolution
+    n_conductance_states = cfg.n_conductance_states
+    t_min = cfg.t_min
+    noise_scale = cfg.noise_scale
+    write_noise_std = noise_scale
+    read_noise_std = 0.1 * write_noise_std
 
     print("Loading data....")
     train_loader, val_loader, test_loader, vocab_size, pad_idx = get_dataloaders(
@@ -147,29 +180,17 @@ def main():
         max_seq_len=block_size,
         dropout=0.3,
         pad_idx=pad_idx,
+        memristor_model_params=None,
+        patch_kwargs={"ADC_resolution": adc_resolution},
+        n_conductance_states=n_conductance_states,
+        read_noise_std=read_noise_std,
     )
     model = model.to(device)
+    shadow_mgr.shadow_params.to(device)
+    shadow_mgr.write_noise_std = write_noise_std
+    shadow_mgr.t_min = t_min
     causal_mask = model.get_causal_mask(block_size, device)
     optimizer = torch.optim.AdamW(shadow_mgr.shadow_params, lr=lr, weight_decay=weight_decay)
-
-    wandb.init(
-        project="Memristor-LM",
-        config={
-            "model": "memristor",
-            "epochs": epochs,
-            "batch_size": batch_size,
-            "block_size": block_size,
-            "max_vocab": max_vocab,
-            "d_model": d_model,
-            "n_layers": n_layers,
-            "n_heads": n_heads,
-            "d_ff": d_ff,
-            "learning_rate": lr,
-            "weight_decay": weight_decay,
-            "dropout": 0.3,
-            "dataset": "WikiText-2",
-        },
-    )
 
     eval_every_steps = 1000
     global_step = [0]

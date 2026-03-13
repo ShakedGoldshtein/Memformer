@@ -17,6 +17,7 @@ from memtorch.mn.Module import patch_model
 from memtorch.bh import Scheme
 from memtorch.bh.memristor.VTEAM import VTEAM
 from memtorch.bh.nonideality.NonIdeality import NonIdeality, apply_nonidealities
+import memtorch.mn as memtorch_mn
 
 
 # VTEAM: r_off/r_on=100, realistic thresholds, time_series_resolution for faster sim (ohms, s, V)
@@ -44,6 +45,27 @@ DEFAULT_PATCH_KWARGS = {
 }
 
 
+class NoisyMemristorLayer(nn.Module):
+    def __init__(self, layer: nn.Module, read_noise_std: float) -> None:
+        super().__init__()
+        self.layer = layer
+        self.read_noise_std = read_noise_std
+
+    def forward(self, *args, **kwargs):
+        y = self.layer(*args, **kwargs)
+        if self.read_noise_std > 0.0 and isinstance(y, torch.Tensor):
+            noise = torch.randn_like(y) * self.read_noise_std * y.abs()
+            y = y + noise
+        return y
+
+
+def _wrap_memristor_linear_layers(module: nn.Module, read_noise_std: float) -> None:
+    for name, child in list(module.named_children()):
+        _wrap_memristor_linear_layers(child, read_noise_std)
+        if isinstance(child, memtorch_mn.Linear):
+            setattr(module, name, NoisyMemristorLayer(child, read_noise_std))
+
+
 class MemristorShadowManager:
     """
     Manages shadow (digital) weights for a memristor-patched model.
@@ -60,11 +82,13 @@ class MemristorShadowManager:
         n_conductance_states: int | None = None,
         t_min: float = 1e-3,
         t_max: float = 1e-2,
+        write_noise_std: float = 0.0,
     ) -> None:
         self.model = model
         self.n_conductance_states = n_conductance_states
         self.t_min = t_min
         self.t_max = t_max
+        self.write_noise_std = write_noise_std
 
         self._pairs: list[tuple[nn.Parameter, nn.Parameter]] = []
         shadows = []
@@ -72,7 +96,7 @@ class MemristorShadowManager:
         for _, p in model.named_parameters():
             if not p.requires_grad:
                 continue
-            shadow = nn.Parameter(p.detach().clone().float())
+            shadow = nn.Parameter(p.detach().clone().to(p.device).float())
             self._pairs.append((p, shadow))
             shadows.append(shadow)
 
@@ -121,7 +145,11 @@ class MemristorShadowManager:
                 num = int(mask.sum().item())
                 if num == 0:
                     continue
-                w_dev[mask] = w_sh[mask]
+                w_target = w_sh[mask]
+                if self.write_noise_std > 0.0:
+                    noise = torch.randn_like(w_target) * self.write_noise_std * w_target.abs()
+                    w_target = w_target + noise
+                w_dev[mask] = w_target
                 updated_elems += num
             else:
                 # Adaptive threshold: higher near |w_dev| max, lower near centre
@@ -139,6 +167,9 @@ class MemristorShadowManager:
 
                 # Target values from shadow
                 w_target = w_sh[mask]
+                if self.write_noise_std > 0.0:
+                    noise = torch.randn_like(w_target) * self.write_noise_std * w_target.abs()
+                    w_target = w_target + noise
 
                 # Uniform quantization between current min/max device weights
                 w_min = float(w_dev.min().item())
@@ -177,6 +208,7 @@ def get_memristor_model(
     memristor_model_params=None,
     patch_kwargs=None,
     n_conductance_states=None,
+    read_noise_std: float = 0.0,
 ):
     """
     Build TransformerLM, optionally load weights, then patch it with MemTorch
@@ -223,6 +255,9 @@ def get_memristor_model(
             [NonIdeality.FiniteConductanceStates],
             conductance_states=n_conductance_states,
         )
+
+    if read_noise_std > 0.0:
+        _wrap_memristor_linear_layers(patched, read_noise_std)
 
     shadow_mgr = MemristorShadowManager(
         patched,
