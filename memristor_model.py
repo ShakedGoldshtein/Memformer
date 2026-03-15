@@ -209,6 +209,8 @@ def get_memristor_model(
     patch_kwargs=None,
     n_conductance_states=None,
     read_noise_std: float = 0.0,
+    non_linearity=None,
+    device_variation=None,
 ):
     """
     Build TransformerLM, optionally load weights, then patch it with MemTorch
@@ -254,6 +256,25 @@ def get_memristor_model(
             patched,
             [NonIdeality.FiniteConductanceStates],
             conductance_states=n_conductance_states,
+        )
+
+    if non_linearity is not None:
+        patched = apply_nonidealities(
+            patched,
+            [NonIdeality.NonLinear],
+            sweep_duration=1.0,
+            sweep_voltage_signal_amplitude=float(non_linearity),
+            sweep_voltage_signal_frequency=1.0,
+        )
+
+    if device_variation is not None and device_variation > 0.0:
+        p = float(device_variation) / 3.0
+        patched = apply_nonidealities(
+            patched,
+            [NonIdeality.DeviceFaults],
+            lrs_proportion=p,
+            hrs_proportion=p,
+            electroform_proportion=p,
         )
 
     if read_noise_std > 0.0:

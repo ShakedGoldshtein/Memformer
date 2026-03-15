@@ -136,6 +136,8 @@ def main():
         n_conductance_states=None,
         noise_scale=0.0,
         t_min=1e-3,
+        non_linearity=1.0,
+        device_variation=0.0,
     )
 
     wandb.init(
@@ -159,6 +161,8 @@ def main():
     n_conductance_states = cfg.n_conductance_states
     t_min = cfg.t_min
     noise_scale = cfg.noise_scale
+    non_linearity = cfg.non_linearity
+    device_variation = cfg.device_variation
     write_noise_std = noise_scale
     read_noise_std = 0.1 * write_noise_std
 
@@ -184,6 +188,8 @@ def main():
         patch_kwargs={"ADC_resolution": adc_resolution},
         n_conductance_states=n_conductance_states,
         read_noise_std=read_noise_std,
+        non_linearity=non_linearity,
+        device_variation=device_variation,
     )
     model = model.to(device)
     shadow_mgr.shadow_params.to(device)
@@ -200,7 +206,7 @@ def main():
         "bad_evals": 0,
         "stop": False,
     }
-    patience_evals = 5
+    patience_evals = 3
 
     for epoch in range(epochs):
         train_loss = train_epoch_memristor(

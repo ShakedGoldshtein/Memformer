@@ -4,4 +4,3 @@ datasets>=2.14
 tokenizers>=0.15
 tqdm
 wandb>=0.15
-memtorch>=1.1.6
