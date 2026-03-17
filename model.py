@@ -1,5 +1,5 @@
 """
-Small transformer language model suitable for M3 with 36GB RAM.
+Small transformer language model.
 """
 import math
 import torch
