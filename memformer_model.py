@@ -1,272 +1,177 @@
 """
-Train memristor-patched transformer on WikiText-2.
+Memformer (memristor-only) model builder.
+
+Wraps the base `TransformerLM` and patches it with MemTorch so that linear
+layers are implemented as memristive crossbars (VTEAM device model by default).
+
+This module is self-contained and does NOT use any digital shadow weights:
+gradients are computed with PyTorch autograd and optimizers update the memristor
+layer parameters directly.
 """
-import os
 import torch
-import torch.nn.functional as F
-from tqdm import tqdm
-import wandb
+import torch.nn as nn
+from model import TransformerLM
+from memtorch.mn.Module import patch_model
+from memtorch.bh import Scheme
+from memtorch.bh.memristor.VTEAM import VTEAM
+from memtorch.bh.nonideality.NonIdeality import NonIdeality, apply_nonidealities
+import memtorch.mn as memtorch_mn
 
-from memristor_model import get_memristor_model
-from train import get_dataloaders, evaluate
 
-MODEL_NAME = "memristor_model"
+# VTEAM: r_off/r_on=100, realistic thresholds, time_series_resolution for faster sim (ohms, s, V)
+DEFAULT_MEMRISTOR_PARAMS = {
+    "time_series_resolution": 1e-6,
+    "r_off": 100_000,
+    "r_on": 1_000,
+    "d": 3e-9,
+    "k_on": -10,
+    "k_off": 5e-4,
+    "alpha_on": 3,
+    "alpha_off": 3,
+    "v_on": -0.3,
+    "v_off": 0.3,
+    "x_on": 0,
+    "x_off": 3e-9,
+}
+
+DEFAULT_PATCH_KWARGS = {
+    "ADC_resolution": 8,
+    "quant_method": "linear",
+    "ADC_overflow_rate": 0.0,
+    "verbose": False,
+    "scheme": Scheme.DoubleColumn,
+}
 
 
-def train_epoch_memristor(
-    model,
-    loader,
-    optimizer,
-    shadow_mgr,
-    device,
-    causal_mask,
-    pad_idx,
-    val_loader=None,
-    eval_every_steps=None,
-    global_step=None,
-    early_state=None,
-    patience_evals=None,
+class NoisyMemristorLayer(nn.Module):
+    def __init__(self, layer: nn.Module, read_noise_std: float) -> None:
+        super().__init__()
+        self.layer = layer
+        self.read_noise_std = read_noise_std
+
+    def forward(self, *args, **kwargs):
+        # Apply duty-cycled single-ended readout (if enabled by the trainer).
+        # We temporarily modify each crossbar's conductance matrix for the duration
+        # of this forward pass, then restore the original conductances so the
+        # underlying device state is preserved.
+        saved = None
+        if isinstance(self.layer, memtorch_mn.Linear):
+            saved = []
+            for cb in getattr(self.layer, "crossbars", []):
+                g = cb.conductance_matrix
+                g_saved = g.detach().clone()
+                saved.append((cb, g_saved))
+                keep = getattr(cb, "_duty_keep", None)
+                g_min = getattr(cb, "_duty_gmin", None)
+                if keep is not None and g_min is not None:
+                    cb.conductance_matrix.copy_(torch.where(keep, g_saved, g_min))
+
+        y = self.layer(*args, **kwargs)
+
+        # Restore original conductances.
+        if saved is not None:
+            for cb, g_saved in saved:
+                cb.conductance_matrix.copy_(g_saved)
+
+        if self.read_noise_std > 0.0 and isinstance(y, torch.Tensor):
+            # Read noise is modeled as additive output noise (e.g., ADC/sensing noise).
+            noise = torch.randn_like(y) * self.read_noise_std
+            y = y + noise
+        return y
+
+
+def _wrap_memristor_linear_layers(module: nn.Module, read_noise_std: float) -> None:
+    for name, child in list(module.named_children()):
+        _wrap_memristor_linear_layers(child, read_noise_std)
+        if isinstance(child, memtorch_mn.Linear):
+            setattr(module, name, NoisyMemristorLayer(child, read_noise_std))
+
+
+def get_memformer_model(
+    vocab_size,
+    d_model=256,
+    n_layers=4,
+    n_heads=4,
+    d_ff=1024,
+    max_seq_len=256,
+    dropout=0.2,
+    pad_idx=0,
+    checkpoint_path=None,
+    memristor_model=VTEAM,
+    memristor_model_params=None,
+    patch_kwargs=None,
+    n_conductance_states=None,
+    read_noise_std: float = 0.0,
+    non_linearity=None,
+    device_variation=None,
 ):
-    model.train()
-    total_loss = 0.0
-    n = 0
-    pbar = tqdm(loader, desc="Train", leave=False)
-    for x, y in pbar:
-        if global_step is not None:
-            global_step[0] += 1
-            step = global_step[0]
-        else:
-            step = None
+    """
+    Build TransformerLM, optionally load weights, then patch it with MemTorch
+    so weights are represented as memristors (VTEAM by default).
 
-        x, y = x.to(device), y.to(device)
-        optimizer.zero_grad()
-
-        logits = model(x, mask=causal_mask)
-        loss = F.cross_entropy(
-            logits.view(-1, logits.size(-1)),
-            y.reshape(-1),
-            ignore_index=pad_idx,
-        )
-        loss.backward()
-
-        # Move gradients from device weights to shadow weights, then step optimizer
-        shadow_mgr.copy_grads_from_device()
-        optimizer.step()
-        shadow_mgr.optimizer_steps += 1
-        shadow_mgr.sync()
-
-        pred = logits.argmax(dim=-1)
-        acc = (pred == y).float().mean().item()
-        total_loss += loss.item() * x.size(0)
-        n += x.size(0)
-
-        log_dict = {
-            "train_loss": loss.item(),
-            "train_accuracy": acc,
-            "write_efficiency": shadow_mgr.write_efficiency,
-        }
-        if step is not None:
-            wandb.log(log_dict, step=step)
-        else:
-            wandb.log(log_dict)
-
-        if (
-            val_loader is not None
-            and eval_every_steps is not None
-            and global_step is not None
-            and step is not None
-            and step % eval_every_steps == 0
-        ):
-            ppl, val_acc, val_loss = evaluate(model, val_loader, device, causal_mask, pad_idx)
-            wandb.log(
-                {
-                    "val_loss": val_loss,
-                    "val_accuracy": val_acc,
-                    "perplexity": ppl,
-                },
-                step=step,
-            )
-            if early_state is not None and patience_evals is not None:
-                if val_loss < early_state["best_val_loss"]:
-                    early_state["best_val_loss"] = val_loss
-                    early_state["best_state"] = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                    early_state["bad_evals"] = 0
-                else:
-                    early_state["bad_evals"] += 1
-                    if early_state["bad_evals"] >= patience_evals:
-                        early_state["stop"] = True
-                        print(f"Early stopping: no val_loss improvement in {patience_evals} evaluations.")
-                        break
-            model.train()
-
-        pbar.set_postfix(
-            loss=f"{loss.item():.4f}",
-            acc=f"{acc:.4f}",
-            weff=f"{shadow_mgr.write_efficiency:.4f}",
-        )
-
-    return total_loss / n if n else 0.0
-
-
-def main():
-    if not os.environ.get("WANDB_API_KEY"):
-        key_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".wandb_key")
-        if os.path.isfile(key_file):
-            with open(key_file) as f:
-                os.environ["WANDB_API_KEY"] = f.read().strip()
-
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-
-    # Default hyperparameters (can be overridden by W&B sweeps)
-    default_config = dict(
-        epochs=3,
-        batch_size=64,
-        block_size=128,
-        max_vocab=15000,
-        d_model=256,
-        n_layers=4,
-        n_heads=4,
-        d_ff=1024,
-        learning_rate=3e-4,
-        weight_decay=0.1,
-        dropout=0.3,
-        dataset="WikiText-2",
-        ADC_resolution=8,
-        n_conductance_states=None,
-        noise_scale=0.0,
-        t_min=1e-3,
-        non_linearity=1.0,
-        device_variation=0.0,
-    )
-
-    wandb.init(
-        project="Memristor-LM",
-        config=default_config,
-    )
-    cfg = wandb.config
-
-    batch_size = cfg.batch_size
-    block_size = cfg.block_size
-    max_vocab = cfg.max_vocab
-    d_model = cfg.d_model
-    n_layers = cfg.n_layers
-    n_heads = cfg.n_heads
-    d_ff = cfg.d_ff
-    lr = cfg.learning_rate
-    weight_decay = cfg.weight_decay
-    epochs = cfg.epochs
-
-    adc_resolution = cfg.ADC_resolution
-    n_conductance_states = cfg.n_conductance_states
-    t_min = cfg.t_min
-    noise_scale = cfg.noise_scale
-    non_linearity = cfg.non_linearity
-    device_variation = cfg.device_variation
-    write_noise_std = noise_scale
-    read_noise_std = 0.1 * write_noise_std
-
-    print("Loading data....")
-    train_loader, val_loader, test_loader, vocab_size, pad_idx = get_dataloaders(
-        batch_size=batch_size,
-        block_size=block_size,
-        max_vocab=max_vocab,
-    )
-    print(f"Vocab size: {vocab_size}")
-
-    print("Building memristor-patched model...")
-    model, shadow_mgr = get_memristor_model(
+    Returns:
+        model: patched memristor model (forward(ids, mask=None), get_causal_mask).
+    """
+    model = TransformerLM(
         vocab_size=vocab_size,
         d_model=d_model,
         n_layers=n_layers,
         n_heads=n_heads,
         d_ff=d_ff,
-        max_seq_len=block_size,
-        dropout=0.3,
+        max_seq_len=max_seq_len,
+        dropout=dropout,
         pad_idx=pad_idx,
-        memristor_model_params=None,
-        patch_kwargs={"ADC_resolution": adc_resolution},
-        n_conductance_states=n_conductance_states,
-        read_noise_std=read_noise_std,
-        non_linearity=non_linearity,
-        device_variation=device_variation,
     )
-    model = model.to(device)
-    shadow_mgr.shadow_params.to(device)
-    shadow_mgr.write_noise_std = write_noise_std
-    shadow_mgr.t_min = t_min
-    causal_mask = model.get_causal_mask(block_size, device)
-    optimizer = torch.optim.AdamW(shadow_mgr.shadow_params, lr=lr, weight_decay=weight_decay)
+    if checkpoint_path is not None:
+        state = torch.load(checkpoint_path, map_location="cpu")
+        if isinstance(state, dict) and "model" in state:
+            state = state["model"]
+        model.load_state_dict(state, strict=False)
 
-    eval_every_steps = 1000
-    global_step = [0]
-    early_state = {
-        "best_val_loss": float("inf"),
-        "best_state": None,
-        "bad_evals": 0,
-        "stop": False,
-    }
-    patience_evals = 3
+    params = memristor_model_params if memristor_model_params is not None else DEFAULT_MEMRISTOR_PARAMS.copy()
+    kwargs = {**DEFAULT_PATCH_KWARGS, **(patch_kwargs or {})}
 
-    for epoch in range(epochs):
-        train_loss = train_epoch_memristor(
-            model,
-            train_loader,
-            optimizer,
-            shadow_mgr,
-            device,
-            causal_mask,
-            pad_idx,
-            val_loader=val_loader,
-            eval_every_steps=eval_every_steps,
-            global_step=global_step,
-            early_state=early_state,
-            patience_evals=patience_evals,
+    patched = patch_model(
+        model,
+        memristor_model,
+        params,
+        **kwargs,
+    )
+
+    if n_conductance_states is not None:
+        patched = apply_nonidealities(
+            patched,
+            [NonIdeality.FiniteConductanceStates],
+            conductance_states=n_conductance_states,
         )
-        if early_state["stop"]:
-            break
 
-        ppl, val_acc, val_loss = evaluate(model, val_loader, device, causal_mask, pad_idx)
-        wandb.log({
-            "train_loss_epoch": train_loss,
-            "perplexity": ppl,
-            "val_accuracy": val_acc,
-            "val_loss": val_loss,
-        }, step=global_step[0])
-        print(f"Epoch {epoch+1}/{epochs}  train_loss={train_loss:.4f}  val_perplexity={ppl:.2f}  val_accuracy={val_acc:.4f}  val_loss={val_loss:.4f}")
+    if non_linearity is not None:
+        patched = apply_nonidealities(
+            patched,
+            [NonIdeality.NonLinear],
+            sweep_duration=1.0,
+            sweep_voltage_signal_amplitude=float(non_linearity),
+            sweep_voltage_signal_frequency=1.0,
+        )
 
-        if val_loss < early_state["best_val_loss"]:
-            early_state["best_val_loss"] = val_loss
-            early_state["best_state"] = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            early_state["bad_evals"] = 0
-        else:
-            early_state["bad_evals"] += 1
-            if early_state["bad_evals"] >= patience_evals:
-                early_state["stop"] = True
-                print(f"Early stopping: no val_loss improvement in {patience_evals} evaluations.")
-                break
+    if device_variation is not None and device_variation > 0.0:
+        p = float(device_variation) / 3.0
+        patched = apply_nonidealities(
+            patched,
+            [NonIdeality.DeviceFaults],
+            lrs_proportion=p,
+            hrs_proportion=p,
+            electroform_proportion=p,
+        )
 
-    if early_state["best_state"] is not None:
-        model.load_state_dict(early_state["best_state"])
-    weights_dir = f"{MODEL_NAME}_weights"
-    run_name = wandb.run.id if wandb.run is not None else "manual_run"
-    run_dir = os.path.join(weights_dir, run_name)
-    os.makedirs(run_dir, exist_ok=True)
-    weights_path = os.path.join(run_dir, "model_weights.pt")
-    torch.save(model.state_dict(), weights_path)
-    print(f"Model weights saved to {weights_path}")
+    if read_noise_std > 0.0:
+        # Read noise is injected in the forward path to emulate ADC / sensing noise.
+        _wrap_memristor_linear_layers(patched, read_noise_std)
 
-    test_ppl, test_acc, test_loss = evaluate(model, test_loader, device, causal_mask, pad_idx)
-    wandb.log({
-        "test_perplexity": test_ppl,
-        "test_accuracy": test_acc,
-        "test_loss": test_loss,
-    })
-    print(f"Test  perplexity={test_ppl:.2f}  accuracy={test_acc:.4f}  loss={test_loss:.4f}")
+    # Ensure MemTorch layers use crossbar-based computation (not the legacy digital matmul path).
+    for m in patched.modules():
+        if isinstance(m, memtorch_mn.Linear):
+            m.forward_legacy_enabled = False
 
-    wandb.finish()
-    print("Training done.")
+    return patched
 
-
-if __name__ == "__main__":
-    main()
