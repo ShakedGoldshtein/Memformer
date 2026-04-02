@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 import wandb
+import memtorch.mn as memtorch_mn
 
 from memristor_model import get_memristor_model
 from train import get_dataloaders, evaluate
@@ -192,6 +193,14 @@ def main():
         device_variation=device_variation,
     )
     model = model.to(device)
+    mem_layers = sum(1 for m in model.modules() if isinstance(m, memtorch_mn.Linear))
+    crossbars = sum(len(getattr(m, "crossbars", [])) for m in model.modules() if isinstance(m, memtorch_mn.Linear))
+    if mem_layers == 0 or crossbars == 0:
+        raise RuntimeError(
+            "MemTorch patch failed: no memtorch Linear layers/crossbars found. "
+            "Check patch_model(module_parameters_to_patch=[nn.Linear]) and environment."
+        )
+    print(f"MemTorch sanity check passed: mem_layers={mem_layers}, crossbars={crossbars}")
     shadow_mgr.shadow_params.to(device)
     shadow_mgr.write_noise_std = write_noise_std
     shadow_mgr.t_min = t_min

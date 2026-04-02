@@ -12,8 +12,11 @@ exceeded, with optional quantization to a finite number of conductance states.
 """
 import torch
 import torch.nn as nn
+from typing import Optional
+from torch.nn.modules.linear import NonDynamicallyQuantizableLinear
 from model import TransformerLM
 from memtorch.mn.Module import patch_model
+from memtorch.mn import Module as memtorch_module
 from memtorch.bh import Scheme
 from memtorch.bh.memristor.VTEAM import VTEAM
 from memtorch.bh.nonideality.NonIdeality import NonIdeality, apply_nonidealities
@@ -79,7 +82,7 @@ class MemristorShadowManager:
     def __init__(
         self,
         model: nn.Module,
-        n_conductance_states: int | None = None,
+        n_conductance_states: Optional[int] = None,
         t_min: float = 1e-3,
         t_max: float = 1e-2,
         write_noise_std: float = 0.0,
@@ -243,11 +246,15 @@ def get_memristor_model(
 
     params = memristor_model_params if memristor_model_params is not None else DEFAULT_MEMRISTOR_PARAMS.copy()
     kwargs = {**DEFAULT_PATCH_KWARGS, **(patch_kwargs or {})}
+    memtorch_module.supported_module_parameters[
+        str(NonDynamicallyQuantizableLinear)
+    ] = memtorch_module.supported_module_parameters[str(nn.Linear)]
 
     patched = patch_model(
         model,
         memristor_model,
         params,
+        module_parameters_to_patch=[nn.Linear],
         **kwargs,
     )
 
